@@ -1,4 +1,7 @@
 TARGETS := $(shell ls scripts | grep -v \\.sh)
+GO_FILES ?= $$(find . -name '*.go' | grep -v generated)
+SHELL := /bin/bash
+
 
 .dapper:
 	@echo Downloading dapper
@@ -7,12 +10,15 @@ TARGETS := $(shell ls scripts | grep -v \\.sh)
 	@./.dapper.tmp -v
 	@mv .dapper.tmp .dapper
 
-$(TARGETS): .dapper
+.PHONY: docker.sock
+docker.sock:
+	while ! docker version 1>/dev/null; do sleep 1; done
+
+$(TARGETS): .dapper docker.sock
 	./.dapper $@
 
 .PHONY: deps
 deps:
-	go mod vendor
 	go mod tidy
 
 release:
@@ -32,3 +38,13 @@ binary-size-check:
 .PHONY: image-scan
 image-scan:
 	scripts/image_scan.sh $(IMAGE)
+
+format:
+	gofmt -s -l -w $(GO_FILES)
+	goimports -w $(GO_FILES)
+
+.PHONY: local
+local:
+	DOCKER_BUILDKIT=1 docker build \
+		--build-arg="REPO TAG GITHUB_TOKEN GOLANG GOCOVER DEBUG" \
+		-t k3s-local -f Dockerfile.local --output=. .

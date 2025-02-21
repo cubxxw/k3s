@@ -4,65 +4,58 @@
 package containerd
 
 import (
-	"context"
-	"os"
+	"net"
 
-	"github.com/containerd/containerd"
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/k3s-io/k3s/pkg/agent/templates"
-	util2 "github.com/k3s-io/k3s/pkg/agent/util"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	util3 "github.com/k3s-io/k3s/pkg/util"
 	"github.com/pkg/errors"
-	"github.com/rancher/wharfie/pkg/registries"
 	"github.com/sirupsen/logrus"
-	"k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/cri-client/pkg/util"
 )
+
+// hostDirectory returns the name of the host dir for a given registry.
+// Colons are not allowed in windows paths, so convert `:port` to `_port_`.
+// Ref: https://github.com/containerd/containerd/blob/v1.7.25/remotes/docker/config/hosts.go#L291-L298
+func hostDirectory(host string) string {
+	if host, port, err := net.SplitHostPort(host); err == nil && port != "" {
+		return host + "_" + port + "_"
+	}
+	return host
+}
 
 func getContainerdArgs(cfg *config.Node) []string {
 	args := []string{
 		"containerd",
 		"-c", cfg.Containerd.Config,
 	}
+	// The legacy version 2 windows containerd config template did include
+	// address/state/root settings, so they do not need to be passed on the command line.
 	return args
 }
 
-// setupContainerdConfig generates the containerd.toml, using a template combined with various
+// SetupContainerdConfig generates the containerd.toml, using a template combined with various
 // runtime configurations and registry mirror settings provided by the administrator.
-func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
-	privRegistries, err := registries.GetPrivateRegistries(cfg.AgentConfig.PrivateRegistry)
-	if err != nil {
-		return err
-	}
-
+func SetupContainerdConfig(cfg *config.Node) error {
 	if cfg.SELinux {
 		logrus.Warn("SELinux isn't supported on windows")
 	}
 
-	var containerdTemplate string
-
+	cfg.DefaultRuntime = "runhcs-wcow-process"
+	cfg.AgentConfig.Snapshotter = "windows"
 	containerdConfig := templates.ContainerdConfig{
 		NodeConfig:            cfg,
 		DisableCgroup:         true,
-		SystemdCgroup:         false,
-		IsRunningInUserNS:     false,
-		PrivateRegistryConfig: privRegistries.Registry,
+		PrivateRegistryConfig: cfg.AgentConfig.Registry,
+		NoDefaultEndpoint:     cfg.Containerd.NoDefault,
 	}
 
-	containerdTemplateBytes, err := os.ReadFile(cfg.Containerd.Template)
-	if err == nil {
-		logrus.Infof("Using containerd template at %s", cfg.Containerd.Template)
-		containerdTemplate = string(containerdTemplateBytes)
-	} else if os.IsNotExist(err) {
-		containerdTemplate = templates.ContainerdConfigTemplate
-	} else {
-		return err
-	}
-	parsedTemplate, err := templates.ParseTemplateFromConfig(containerdTemplate, containerdConfig)
-	if err != nil {
+	if err := writeContainerdConfig(cfg, containerdConfig); err != nil {
 		return err
 	}
 
-	return util2.WriteFile(cfg.Containerd.Config, parsedTemplate)
+	return writeContainerdHosts(cfg, containerdConfig)
 }
 
 func Client(address string) (*containerd.Client, error) {

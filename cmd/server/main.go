@@ -22,9 +22,9 @@ import (
 	"github.com/k3s-io/k3s/pkg/containerd"
 	ctr2 "github.com/k3s-io/k3s/pkg/ctr"
 	kubectl2 "github.com/k3s-io/k3s/pkg/kubectl"
-	crictl2 "github.com/kubernetes-sigs/cri-tools/cmd/crictl"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	crictl2 "sigs.k8s.io/cri-tools/cmd/crictl"
 )
 
 func init() {
@@ -54,9 +54,9 @@ func main() {
 			token.Delete,
 			token.Generate,
 			token.List,
+			token.Rotate,
 		),
 		cmds.NewEtcdSnapshotCommands(
-			etcdsnapshot.Run,
 			etcdsnapshot.Delete,
 			etcdsnapshot.List,
 			etcdsnapshot.Prune,
@@ -69,17 +69,17 @@ func main() {
 			secretsencrypt.Prepare,
 			secretsencrypt.Rotate,
 			secretsencrypt.Reencrypt,
+			secretsencrypt.RotateKeys,
 		),
-		cmds.NewCertCommand(
-			cmds.NewCertSubcommands(
-				cert.Rotate,
-				cert.RotateCA,
-			),
+		cmds.NewCertCommands(
+			cert.Check,
+			cert.Rotate,
+			cert.RotateCA,
 		),
 		cmds.NewCompletionCommand(completion.Run),
 	}
 
 	if err := app.Run(configfilearg.MustParse(os.Args)); err != nil && !errors.Is(err, context.Canceled) {
-		logrus.Fatal(err)
+		logrus.Fatalf("Error: %v", err)
 	}
 }

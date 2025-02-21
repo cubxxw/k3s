@@ -19,124 +19,30 @@ limitations under the License.
 package fake
 
 import (
-	"context"
-
-	k3scattleiov1 "github.com/k3s-io/k3s/pkg/apis/k3s.cattle.io/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
-	testing "k8s.io/client-go/testing"
+	v1 "github.com/k3s-io/k3s/pkg/apis/k3s.cattle.io/v1"
+	k3scattleiov1 "github.com/k3s-io/k3s/pkg/generated/clientset/versioned/typed/k3s.cattle.io/v1"
+	gentype "k8s.io/client-go/gentype"
 )
 
-// FakeAddons implements AddonInterface
-type FakeAddons struct {
+// fakeAddons implements AddonInterface
+type fakeAddons struct {
+	*gentype.FakeClientWithList[*v1.Addon, *v1.AddonList]
 	Fake *FakeK3sV1
-	ns   string
 }
 
-var addonsResource = schema.GroupVersionResource{Group: "k3s.cattle.io", Version: "v1", Resource: "addons"}
-
-var addonsKind = schema.GroupVersionKind{Group: "k3s.cattle.io", Version: "v1", Kind: "Addon"}
-
-// Get takes name of the addon, and returns the corresponding addon object, and an error if there is any.
-func (c *FakeAddons) Get(ctx context.Context, name string, options v1.GetOptions) (result *k3scattleiov1.Addon, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(addonsResource, c.ns, name), &k3scattleiov1.Addon{})
-
-	if obj == nil {
-		return nil, err
+func newFakeAddons(fake *FakeK3sV1, namespace string) k3scattleiov1.AddonInterface {
+	return &fakeAddons{
+		gentype.NewFakeClientWithList[*v1.Addon, *v1.AddonList](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("addons"),
+			v1.SchemeGroupVersion.WithKind("Addon"),
+			func() *v1.Addon { return &v1.Addon{} },
+			func() *v1.AddonList { return &v1.AddonList{} },
+			func(dst, src *v1.AddonList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.AddonList) []*v1.Addon { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1.AddonList, items []*v1.Addon) { list.Items = gentype.FromPointerSlice(items) },
+		),
+		fake,
 	}
-	return obj.(*k3scattleiov1.Addon), err
-}
-
-// List takes label and field selectors, and returns the list of Addons that match those selectors.
-func (c *FakeAddons) List(ctx context.Context, opts v1.ListOptions) (result *k3scattleiov1.AddonList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(addonsResource, addonsKind, c.ns, opts), &k3scattleiov1.AddonList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &k3scattleiov1.AddonList{ListMeta: obj.(*k3scattleiov1.AddonList).ListMeta}
-	for _, item := range obj.(*k3scattleiov1.AddonList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested addons.
-func (c *FakeAddons) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(addonsResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a addon and creates it.  Returns the server's representation of the addon, and an error, if there is any.
-func (c *FakeAddons) Create(ctx context.Context, addon *k3scattleiov1.Addon, opts v1.CreateOptions) (result *k3scattleiov1.Addon, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(addonsResource, c.ns, addon), &k3scattleiov1.Addon{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*k3scattleiov1.Addon), err
-}
-
-// Update takes the representation of a addon and updates it. Returns the server's representation of the addon, and an error, if there is any.
-func (c *FakeAddons) Update(ctx context.Context, addon *k3scattleiov1.Addon, opts v1.UpdateOptions) (result *k3scattleiov1.Addon, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(addonsResource, c.ns, addon), &k3scattleiov1.Addon{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*k3scattleiov1.Addon), err
-}
-
-// UpdateStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *FakeAddons) UpdateStatus(ctx context.Context, addon *k3scattleiov1.Addon, opts v1.UpdateOptions) (*k3scattleiov1.Addon, error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateSubresourceAction(addonsResource, "status", c.ns, addon), &k3scattleiov1.Addon{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*k3scattleiov1.Addon), err
-}
-
-// Delete takes name of the addon and deletes it. Returns an error if one occurs.
-func (c *FakeAddons) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteActionWithOptions(addonsResource, c.ns, name, opts), &k3scattleiov1.Addon{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakeAddons) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(addonsResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &k3scattleiov1.AddonList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched addon.
-func (c *FakeAddons) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *k3scattleiov1.Addon, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(addonsResource, c.ns, name, pt, data, subresources...), &k3scattleiov1.Addon{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*k3scattleiov1.Addon), err
 }

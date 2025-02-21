@@ -3,18 +3,15 @@ package control
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/daemons/control/proxy"
-	"github.com/k3s-io/k3s/pkg/generated/clientset/versioned/scheme"
 	"github.com/k3s-io/k3s/pkg/nodeconfig"
 	"github.com/k3s-io/k3s/pkg/util"
 	"github.com/k3s-io/k3s/pkg/version"
@@ -23,9 +20,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/yl2chen/cidranger"
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/kubernetes"
 )
@@ -34,8 +28,7 @@ var defaultDialer = net.Dialer{}
 
 func loggingErrorWriter(rw http.ResponseWriter, req *http.Request, code int, err error) {
 	logrus.Debugf("Tunnel server error: %d %v", code, err)
-	rw.WriteHeader(code)
-	rw.Write([]byte(err.Error()))
+	util.SendError(err, rw, req, code)
 }
 
 func setupTunnel(ctx context.Context, cfg *config.Control) (http.Handler, error) {
@@ -45,7 +38,7 @@ func setupTunnel(ctx context.Context, cfg *config.Control) (http.Handler, error)
 		server: remotedialer.New(authorizer, loggingErrorWriter),
 		egress: map[string]bool{},
 	}
-	go tunnel.watch(ctx)
+	cfg.Runtime.ClusterControllerStarts["tunnel-server"] = tunnel.watch
 	return tunnel, nil
 }
 
@@ -112,17 +105,10 @@ func (t *TunnelServer) watch(ctx context.Context) {
 		return
 	}
 
-	for {
-		if t.config.Runtime.Core != nil {
-			t.config.Runtime.Core.Core().V1().Node().OnChange(ctx, version.Program+"-tunnel-server", t.onChangeNode)
-			switch t.config.EgressSelectorMode {
-			case config.EgressSelectorModeCluster, config.EgressSelectorModePod:
-				t.config.Runtime.Core.Core().V1().Pod().OnChange(ctx, version.Program+"-tunnel-server", t.onChangePod)
-			}
-			return
-		}
-		logrus.Infof("Tunnel server egress proxy waiting for runtime core to become available")
-		time.Sleep(5 * time.Second)
+	t.config.Runtime.Core.Core().V1().Node().OnChange(ctx, version.Program+"-tunnel-server", t.onChangeNode)
+	switch t.config.EgressSelectorMode {
+	case config.EgressSelectorModeCluster, config.EgressSelectorModePod:
+		t.config.Runtime.Core.Core().V1().Pod().OnChange(ctx, version.Program+"-tunnel-server", t.onChangePod)
 	}
 }
 
@@ -173,7 +159,6 @@ func (t *TunnelServer) onChangePod(podName string, pod *v1.Pod) (*v1.Pod, error)
 		}
 	}
 	return pod, nil
-
 }
 
 // serveConnect attempts to handle the HTTP CONNECT request by dialing
@@ -181,29 +166,20 @@ func (t *TunnelServer) onChangePod(podName string, pod *v1.Pod) (*v1.Pod, error)
 func (t *TunnelServer) serveConnect(resp http.ResponseWriter, req *http.Request) {
 	bconn, err := t.dialBackend(req.Context(), req.Host)
 	if err != nil {
-		responsewriters.ErrorNegotiated(
-			apierrors.NewServiceUnavailable(err.Error()),
-			scheme.Codecs.WithoutConversion(), schema.GroupVersion{}, resp, req,
-		)
+		util.SendError(err, resp, req, http.StatusBadGateway)
 		return
 	}
 
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
-		responsewriters.ErrorNegotiated(
-			apierrors.NewInternalError(errors.New("hijacking not supported")),
-			scheme.Codecs.WithoutConversion(), schema.GroupVersion{}, resp, req,
-		)
+		util.SendError(errors.New("hijacking not supported"), resp, req, http.StatusInternalServerError)
 		return
 	}
 	resp.WriteHeader(http.StatusOK)
 
 	rconn, bufrw, err := hijacker.Hijack()
 	if err != nil {
-		responsewriters.ErrorNegotiated(
-			apierrors.NewInternalError(err),
-			scheme.Codecs.WithoutConversion(), schema.GroupVersion{}, resp, req,
-		)
+		util.SendError(err, resp, req, http.StatusInternalServerError)
 		return
 	}
 
@@ -220,7 +196,6 @@ func (t *TunnelServer) dialBackend(ctx context.Context, addr string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	loopback := t.config.Loopback(true)
 
 	var nodeName string
 	var toKubelet, useTunnel bool
@@ -247,14 +222,17 @@ func (t *TunnelServer) dialBackend(ctx context.Context, addr string) (net.Conn, 
 		useTunnel = true
 	}
 
-	// Always dial kubelet via the loopback address.
-	if toKubelet {
-		addr = fmt.Sprintf("%s:%s", loopback, port)
-	}
-
 	// If connecting to something hosted by the local node, don't tunnel
 	if nodeName == t.config.ServerNodeName {
 		useTunnel = false
+		if toKubelet {
+			// Dial local kubelet at the configured bind address
+			addr = net.JoinHostPort(t.config.BindAddress, port)
+		}
+	} else if toKubelet {
+		// Dial remote kubelet via the loopback address, the remotedialer client
+		// will ensure that it hits the right local address.
+		addr = net.JoinHostPort(t.config.Loopback(false), port)
 	}
 
 	if useTunnel {

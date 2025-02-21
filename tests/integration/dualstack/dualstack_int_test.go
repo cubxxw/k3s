@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	tests "github.com/k3s-io/k3s/tests"
 	testutil "github.com/k3s-io/k3s/tests/integration"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -13,8 +14,8 @@ import (
 var dualStackServer *testutil.K3sServer
 var dualStackServerArgs = []string{
 	"--cluster-init",
-	"--cluster-cidr 10.42.0.0/16,2001:cafe:42:0::/56",
-	"--service-cidr 10.43.0.0/16,2001:cafe:42:1::/112",
+	"--cluster-cidr", "10.42.0.0/16,2001:cafe:42::/56",
+	"--service-cidr", "10.43.0.0/16,2001:cafe:43::/112",
 	"--disable-network-policy",
 }
 var testLock int
@@ -40,14 +41,12 @@ var _ = Describe("dual stack", Ordered, func() {
 	When("a ipv4 and ipv6 cidr is present", func() {
 		It("starts up with no problems", func() {
 			Eventually(func() error {
-				return testutil.K3sDefaultDeployments()
+				return tests.CheckDefaultDeployments(testutil.DefaultConfig)
 			}, "180s", "10s").Should(Succeed())
 		})
 		It("creates pods with two IPs", func() {
-			podname, err := testutil.K3sCmd("kubectl", "get", "pods", "-n", "kube-system", "-o", "jsonpath={.items[?(@.metadata.labels.app\\.kubernetes\\.io/name==\"traefik\")].metadata.name}")
-			Expect(err).NotTo(HaveOccurred())
 			Eventually(func() (string, error) {
-				return testutil.K3sCmd("kubectl", "exec", podname, "-n", "kube-system", "--", "ip", "a")
+				return testutil.K3sCmd("kubectl", "exec", "deployment/traefik", "-n", "kube-system", "--", "ip", "a")
 			}, "5s", "1s").Should(ContainSubstring("2001:cafe:42:"))
 		})
 	})

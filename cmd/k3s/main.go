@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
 	"github.com/k3s-io/k3s/pkg/configfilearg"
@@ -20,16 +21,21 @@ import (
 	"github.com/k3s-io/k3s/pkg/untar"
 	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/pkg/errors"
-	"github.com/rancher/wrangler/pkg/resolvehome"
+	"github.com/rancher/wrangler/v3/pkg/resolvehome"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"github.com/urfave/cli"
 )
 
 var criDefaultConfigPath = "/etc/crictl.yaml"
+var externalCLIActions = []string{"crictl", "ctr", "kubectl"}
 
 // main entrypoint for the k3s multicall binary
 func main() {
+	if findDebug(os.Args) {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
+
 	dataDir := findDataDir(os.Args)
 
 	// Handle direct invocation via symlink alias (multicall binary behavior)
@@ -46,8 +52,8 @@ func main() {
 	app := cmds.NewApp()
 	app.EnableBashCompletion = true
 	app.Commands = []cli.Command{
-		cmds.NewServerCommand(internalCLIAction(version.Program+"-server", dataDir, os.Args)),
-		cmds.NewAgentCommand(internalCLIAction(version.Program+"-agent", dataDir, os.Args)),
+		cmds.NewServerCommand(internalCLIAction(version.Program+"-server"+programPostfix, dataDir, os.Args)),
+		cmds.NewAgentCommand(internalCLIAction(version.Program+"-agent"+programPostfix, dataDir, os.Args)),
 		cmds.NewKubectlCommand(externalCLIAction("kubectl", dataDir)),
 		cmds.NewCRICTL(externalCLIAction("crictl", dataDir)),
 		cmds.NewCtrCommand(externalCLIAction("ctr", dataDir)),
@@ -57,9 +63,9 @@ func main() {
 			tokenCommand,
 			tokenCommand,
 			tokenCommand,
+			tokenCommand,
 		),
 		cmds.NewEtcdSnapshotCommands(
-			etcdsnapshotCommand,
 			etcdsnapshotCommand,
 			etcdsnapshotCommand,
 			etcdsnapshotCommand,
@@ -72,26 +78,47 @@ func main() {
 			secretsencryptCommand,
 			secretsencryptCommand,
 			secretsencryptCommand,
+			secretsencryptCommand,
 		),
-		cmds.NewCertCommand(
-			cmds.NewCertSubcommands(
-				certCommand,
-				certCommand,
-			),
+		cmds.NewCertCommands(
+			certCommand,
+			certCommand,
+			certCommand,
 		),
 		cmds.NewCompletionCommand(internalCLIAction(version.Program+"-completion", dataDir, os.Args)),
 	}
 
 	if err := app.Run(os.Args); err != nil && !errors.Is(err, context.Canceled) {
-		logrus.Fatal(err)
+		logrus.Fatalf("Error: %v", err)
 	}
 }
 
-// findDataDir reads data-dir settings from the CLI args and config file.
+// findDebug reads debug settings from the environment, CLI args, and config file.
+func findDebug(args []string) bool {
+	debug, _ := strconv.ParseBool(os.Getenv(version.ProgramUpper + "_DEBUG"))
+	if debug {
+		return debug
+	}
+	fs := pflag.NewFlagSet("debug-set", pflag.ContinueOnError)
+	fs.ParseErrorsWhitelist.UnknownFlags = true
+	fs.SetOutput(io.Discard)
+	fs.BoolVarP(&debug, "debug", "", false, "(logging) Turn on debug logs")
+	fs.Parse(args)
+	if debug {
+		return debug
+	}
+	debug, _ = strconv.ParseBool(configfilearg.MustFindString(args, "debug", externalCLIActions...))
+	return debug
+}
+
+// findDataDir reads data-dir settings from the environment, CLI args, and config file.
 // If not found, the default will be used, which varies depending on whether
 // k3s is being run as root or not.
 func findDataDir(args []string) string {
-	var dataDir string
+	dataDir := os.Getenv(version.ProgramUpper + "_DATA_DIR")
+	if dataDir != "" {
+		return dataDir
+	}
 	fs := pflag.NewFlagSet("data-dir-set", pflag.ContinueOnError)
 	fs.ParseErrorsWhitelist.UnknownFlags = true
 	fs.SetOutput(io.Discard)
@@ -100,7 +127,7 @@ func findDataDir(args []string) string {
 	if dataDir != "" {
 		return dataDir
 	}
-	dataDir = configfilearg.MustFindString(args, "data-dir")
+	dataDir = configfilearg.MustFindString(args, "data-dir", externalCLIActions...)
 	if d, err := datadir.Resolve(dataDir); err == nil {
 		dataDir = d
 	} else {
@@ -118,7 +145,7 @@ func findPreferBundledBin(args []string) bool {
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&preferBundledBin, "prefer-bundled-bin", false, "Prefer bundled binaries")
 
-	preferRes := configfilearg.MustFindString(args, "prefer-bundled-bin")
+	preferRes := configfilearg.MustFindString(args, "prefer-bundled-bin", externalCLIActions...)
 	if preferRes != "" {
 		preferBundledBin, _ = strconv.ParseBool(preferRes)
 	}
@@ -133,8 +160,7 @@ func findPreferBundledBin(args []string) bool {
 // it returns false so that standard CLI wrapping can occur.
 func runCLIs(dataDir string) bool {
 	progName := filepath.Base(os.Args[0])
-	switch progName {
-	case "crictl", "ctr", "kubectl":
+	if slices.Contains(externalCLIActions, progName) {
 		if err := externalCLI(progName, dataDir, os.Args[1:]); err != nil && !errors.Is(err, context.Canceled) {
 			logrus.Fatal(err)
 		}
@@ -158,7 +184,7 @@ func externalCLI(cli, dataDir string, args []string) error {
 			os.Setenv("CRI_CONFIG_FILE", findCriConfig(dataDir))
 		}
 	}
-	return stageAndRun(dataDir, cli, append([]string{cli}, args...))
+	return stageAndRun(dataDir, cli, append([]string{cli}, args...), false)
 }
 
 // internalCLIAction returns a function that will call a K3s internal command, be used as the Action of a cli.Command.
@@ -174,27 +200,35 @@ func internalCLIAction(cmd, dataDir string, args []string) func(ctx *cli.Context
 
 // stageAndRunCLI calls an external binary.
 func stageAndRunCLI(cli *cli.Context, cmd string, dataDir string, args []string) error {
-	return stageAndRun(dataDir, cmd, args)
+	return stageAndRun(dataDir, cmd, args, true)
 }
 
 // stageAndRun does the actual work of setting up and calling an external binary.
-func stageAndRun(dataDir, cmd string, args []string) error {
+func stageAndRun(dataDir, cmd string, args []string, calledAsInternal bool) error {
 	dir, err := extract(dataDir)
 	if err != nil {
 		return errors.Wrap(err, "extracting data")
 	}
 	logrus.Debugf("Asset dir %s", dir)
 
-	var pathEnv string
+	pathList := []string{
+		filepath.Clean(filepath.Join(dir, "..", "cni")),
+		filepath.Join(dir, "bin"),
+	}
 	if findPreferBundledBin(args) {
-		pathEnv = filepath.Join(dir, "bin") + ":" + filepath.Join(dir, "bin/aux") + ":" + os.Getenv("PATH")
+		pathList = append(
+			pathList,
+			filepath.Join(dir, "bin", "aux"),
+			os.Getenv("PATH"),
+		)
 	} else {
-		pathEnv = filepath.Join(dir, "bin") + ":" + os.Getenv("PATH") + ":" + filepath.Join(dir, "bin/aux")
+		pathList = append(
+			pathList,
+			os.Getenv("PATH"),
+			filepath.Join(dir, "bin", "aux"),
+		)
 	}
-	if err := os.Setenv("PATH", pathEnv); err != nil {
-		return err
-	}
-	if err := os.Setenv(version.ProgramUpper+"_DATA_DIR", dir); err != nil {
+	if err := os.Setenv("PATH", strings.Join(pathList, string(os.PathListSeparator))); err != nil {
 		return err
 	}
 
@@ -205,7 +239,7 @@ func stageAndRun(dataDir, cmd string, args []string) error {
 
 	logrus.Debugf("Running %s %v", cmd, args)
 
-	return syscall.Exec(cmd, args, os.Environ())
+	return runExec(cmd, args, calledAsInternal)
 }
 
 // getAssetAndDir returns the name of the bindata asset, along with a directory path
@@ -219,16 +253,20 @@ func getAssetAndDir(dataDir string) (string, string) {
 // extract checks for and if necessary unpacks the bindata archive, returning the unique path
 // to the extracted bindata asset.
 func extract(dataDir string) (string, error) {
-	// first look for global asset folder so we don't create a HOME version if not needed
-	_, dir := getAssetAndDir(datadir.DefaultDataDir)
-	if _, err := os.Stat(filepath.Join(dir, "bin", "k3s")); err == nil {
+	// check if content already exists in requested data-dir
+	asset, dir := getAssetAndDir(dataDir)
+	if _, err := os.Stat(filepath.Join(dir, "bin", "k3s"+programPostfix)); err == nil {
 		return dir, nil
 	}
 
-	asset, dir := getAssetAndDir(dataDir)
-	// check if target content already exists
-	if _, err := os.Stat(filepath.Join(dir, "bin", "k3s")); err == nil {
-		return dir, nil
+	// check if content exists in default path as a fallback, prior
+	// to extracting. This will prevent re-extracting into the user's home
+	// dir if the assets already exist in the default path.
+	if dataDir != datadir.DefaultDataDir {
+		_, defaultDir := getAssetAndDir(datadir.DefaultDataDir)
+		if _, err := os.Stat(filepath.Join(defaultDir, "bin", "k3s"+programPostfix)); err == nil {
+			return defaultDir, nil
+		}
 	}
 
 	// acquire a data directory lock
@@ -265,6 +303,53 @@ func extract(dataDir string) (string, error) {
 		return "", err
 	}
 
+	// Create a stable CNI bin dir and place it first in the path so that users have a
+	// consistent location to drop their own CNI plugin binaries.
+	cniPath := filepath.Join(dataDir, "data", "cni")
+	cniBin := filepath.Join(dir, "bin", "cni")
+	if err := os.MkdirAll(cniPath, 0755); err != nil {
+		return "", err
+	}
+	// Create symlink that points at the cni multicall binary itself
+	logrus.Debugf("Creating symlink %s -> %s", filepath.Join(cniPath, "cni"), cniBin)
+	os.Remove(filepath.Join(cniPath, "cni"))
+	if err := os.Symlink(cniBin, filepath.Join(cniPath, "cni")); err != nil {
+		return "", err
+	}
+
+	// Find symlinks that point to the cni multicall binary, and clone them in the stable CNI bin dir.
+	// Non-symlink plugins in the stable CNI bin dir will not be overwritten, to allow users to replace our
+	// CNI plugins with their own versions if they want. Note that the cni multicall binary itself is always
+	// symlinked into the stable bin dir and should not be replaced.
+	ents, err := os.ReadDir(filepath.Join(tempDest, "bin"))
+	if err != nil {
+		return "", err
+	}
+	for _, ent := range ents {
+		if info, err := ent.Info(); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+			if target, err := os.Readlink(filepath.Join(tempDest, "bin", ent.Name())); err == nil && target == "cni" {
+				src := filepath.Join(cniPath, ent.Name())
+				// Check if plugin already exists in stable CNI bin dir
+				if info, err := os.Lstat(src); err == nil {
+					if info.Mode()&fs.ModeSymlink != 0 {
+						// Exists and is a symlink, remove it so we can create a new symlink for the new bin.
+						os.Remove(src)
+					} else {
+						// Not a symlink, leave it alone
+						logrus.Debugf("Not replacing non-symlink CNI plugin %s with mode %O", src, info.Mode())
+						continue
+					}
+				}
+				logrus.Debugf("Creating symlink %s -> %s", src, cniBin)
+				if err := os.Symlink(cniBin, src); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+
+	// Rotate 'current' symlink into 'previous', and create a new 'current' that points
+	// at the new directory.
 	currentSymLink := filepath.Join(dataDir, "data", "current")
 	previousSymLink := filepath.Join(dataDir, "data", "previous")
 	if _, err := os.Lstat(currentSymLink); err == nil {
@@ -275,7 +360,14 @@ func extract(dataDir string) (string, error) {
 	if err := os.Symlink(dir, currentSymLink); err != nil {
 		return "", err
 	}
-	return dir, os.Rename(tempDest, dir)
+
+	// Rename the new directory into place after updating symlinks, so that the k3s binary check at the start
+	// of this function only succeeds if everything else has been completed successfully.
+	if err := os.Rename(tempDest, dir); err != nil {
+		return "", err
+	}
+
+	return dir, nil
 }
 
 // findCriConfig returns the path to crictl.yaml

@@ -19,7 +19,7 @@ What is this?
 K3s is a [fully conformant](https://github.com/cncf/k8s-conformance/pulls?q=is%3Apr+k3s) production-ready Kubernetes distribution with the following changes:
 
 1. It is packaged as a single binary.
-1. It adds support for sqlite3 as the default storage backend. Etcd3, MySQL, and Postgres are also supported.
+1. It adds support for sqlite3 as the default storage backend. Etcd3, MariaDB, MySQL, and Postgres are also supported.
 1. It wraps Kubernetes and other components in a single, simple launcher.
 1. It is secure by default with reasonable defaults for lightweight environments.
 1. It has minimal to no OS dependencies (just a sane kernel and cgroup mounts needed).
@@ -46,7 +46,7 @@ Additionally, K3s simplifies Kubernetes operations by maintaining functionality 
 * Managing the TLS certificates of Kubernetes components
 * Managing the connection between worker and server nodes
 * Auto-deploying Kubernetes resources from local manifests in realtime as they are changed.
-* Managing an embedded etcd cluster (work in progress)
+* Managing an embedded etcd cluster
 
 Current Status
 --------------
@@ -61,7 +61,7 @@ What's with the name?
 
 We wanted an installation of Kubernetes that was half the size in terms of memory footprint. Kubernetes is a
 10 letter word stylized as k8s. So something half as big as Kubernetes would be a 5 letter word stylized as
-K3s. There is neither a long-form of K3s nor official pronunciation.
+K3s. A '3' is also an '8' cut in half vertically. There is neither a long-form of K3s nor official pronunciation.
 
 Is this a fork?
 ---------------
@@ -103,12 +103,12 @@ Release cadence
 
 K3s maintains pace with upstream Kubernetes releases. Our goal is to release patch releases within one week, and new minors within 30 days.
 
-Our release versioning reflects the version of upstream Kubernetes that is being released. For example, the K3s release [v1.18.6+k3s1](https://github.com/k3s-io/k3s/releases/tag/v1.18.6%2Bk3s1) maps to the `v1.18.6` Kubernetes release. We add a postfix in the form of `+k3s<number>` to allow us to make additional releases using the same version of upstream Kubernetes while remaining [semver](https://semver.org/) compliant. For example, if we discovered a high severity bug in `v1.18.6+k3s1` and needed to release an immediate fix for it, we would release `v1.18.6+k3s2`.
+Our release versioning reflects the version of upstream Kubernetes that is being released. For example, the K3s release [v1.27.4+k3s1](https://github.com/k3s-io/k3s/releases/tag/v1.27.4%2Bk3s1) maps to the `v1.27.4` Kubernetes release. We add a postfix in the form of `+k3s<number>` to allow us to make additional releases using the same version of upstream Kubernetes while remaining [semver](https://semver.org/) compliant. For example, if we discovered a high severity bug in `v1.27.4+k3s1` and needed to release an immediate fix for it, we would release `v1.27.4+k3s2`.
 
 Documentation
 -------------
 
-Please see [the official docs site](https://rancher.com/docs/k3s/latest/en/) for complete documentation.
+Please see [the official docs site](https://docs.k3s.io) for complete documentation.
 
 Quick-Start - Install Script
 --------------

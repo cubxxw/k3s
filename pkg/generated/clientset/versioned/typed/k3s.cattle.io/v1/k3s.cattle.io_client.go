@@ -19,16 +19,17 @@ limitations under the License.
 package v1
 
 import (
-	"net/http"
+	http "net/http"
 
-	v1 "github.com/k3s-io/k3s/pkg/apis/k3s.cattle.io/v1"
-	"github.com/k3s-io/k3s/pkg/generated/clientset/versioned/scheme"
+	k3scattleiov1 "github.com/k3s-io/k3s/pkg/apis/k3s.cattle.io/v1"
+	scheme "github.com/k3s-io/k3s/pkg/generated/clientset/versioned/scheme"
 	rest "k8s.io/client-go/rest"
 )
 
 type K3sV1Interface interface {
 	RESTClient() rest.Interface
 	AddonsGetter
+	ETCDSnapshotFilesGetter
 }
 
 // K3sV1Client is used to interact with features provided by the k3s.cattle.io group.
@@ -38,6 +39,10 @@ type K3sV1Client struct {
 
 func (c *K3sV1Client) Addons(namespace string) AddonInterface {
 	return newAddons(c, namespace)
+}
+
+func (c *K3sV1Client) ETCDSnapshotFiles() ETCDSnapshotFileInterface {
+	return newETCDSnapshotFiles(c)
 }
 
 // NewForConfig creates a new K3sV1Client for the given config.
@@ -85,10 +90,10 @@ func New(c rest.Interface) *K3sV1Client {
 }
 
 func setConfigDefaults(config *rest.Config) error {
-	gv := v1.SchemeGroupVersion
+	gv := k3scattleiov1.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs).WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/k3s-io/k3s/pkg/rootless"
-	coreClients "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	coreClients "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rootless-containers/rootlesskit/pkg/api/client"
 	"github.com/rootless-containers/rootlesskit/pkg/port"
 	"github.com/sirupsen/logrus"
@@ -143,11 +143,14 @@ func (h *handler) toBindPorts() (map[int]int, error) {
 					continue
 				}
 
-				if port.Port != 0 {
-					if port.Port <= 1024 {
-						toBindPorts[10000+int(port.Port)] = int(port.Port)
+				for _, toBindPort := range []int32{port.Port, port.NodePort} {
+					if toBindPort == 0 {
+						continue
+					}
+					if toBindPort <= 1024 {
+						toBindPorts[10000+int(toBindPort)] = int(toBindPort)
 					} else {
-						toBindPorts[int(port.Port)] = int(port.Port)
+						toBindPorts[int(toBindPort)] = int(toBindPort)
 					}
 				}
 			}

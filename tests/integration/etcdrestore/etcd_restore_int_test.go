@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	tests "github.com/k3s-io/k3s/tests"
 	testutil "github.com/k3s-io/k3s/tests/integration"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -33,13 +34,18 @@ var _ = Describe("etcd snapshot restore", Ordered, func() {
 	When("a snapshot is restored on existing node", func() {
 		It("etcd starts up with no problems", func() {
 			Eventually(func() error {
-				return testutil.K3sDefaultDeployments()
+				return tests.CheckDefaultDeployments(testutil.DefaultConfig)
 			}, "180s", "5s").Should(Succeed())
 		})
 		It("create a workload", func() {
 			result, err := testutil.K3sCmd("kubectl", "create", "-f", "./testdata/temp_depl.yaml")
 			Expect(result).To(ContainSubstring("deployment.apps/nginx-deployment created"))
 			Expect(err).NotTo(HaveOccurred())
+		})
+		It("make sure workload exists", func() {
+			res, err := testutil.K3sCmd("kubectl", "rollout", "status", "deployment", "nginx-deployment", "--watch=true", "--timeout=360s")
+			Expect(res).To(ContainSubstring("successfully rolled out"))
+			Expect(err).ToNot(HaveOccurred())
 		})
 		It("saves an etcd snapshot", func() {
 			Expect(testutil.K3sCmd("etcd-snapshot", "save", "-d", tmpdDataDir, "--name", "snapshot-to-restore")).
@@ -80,18 +86,18 @@ var _ = Describe("etcd snapshot restore", Ordered, func() {
 		})
 		It("starts up with no problems", func() {
 			Eventually(func() error {
-				return testutil.K3sDefaultDeployments()
+				return tests.CheckDefaultDeployments(testutil.DefaultConfig)
 			}, "360s", "5s").Should(Succeed())
 		})
-		It("Make sure Workload 1 exists", func() {
-			Eventually(func() (string, error) {
-				return testutil.K3sCmd("kubectl", "get", "deployment", "nginx-deployment")
-			}, "360s", "5s").Should(ContainSubstring("3/3"))
+		It("make sure workload 1 exists", func() {
+			res, err := testutil.K3sCmd("kubectl", "rollout", "status", "deployment", "nginx-deployment", "--watch=true", "--timeout=360s")
+			Expect(res).To(ContainSubstring("successfully rolled out"))
+			Expect(err).ToNot(HaveOccurred())
 		})
-		It("Make sure Workload 2 does not exists", func() {
+		It("make sure workload 2 does not exists", func() {
 			res, err := testutil.K3sCmd("kubectl", "get", "deployment", "nginx-deployment-post-snapshot")
-			Expect(err).To(HaveOccurred())
 			Expect(res).To(ContainSubstring("not found"))
+			Expect(err).To(HaveOccurred())
 		})
 		It("check if CA cert hash matches", func() {
 			// get md5sum of the CA certs

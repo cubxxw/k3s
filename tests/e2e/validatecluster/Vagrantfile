@@ -2,13 +2,14 @@ ENV['VAGRANT_NO_PARALLEL'] = 'no'
 NODE_ROLES = (ENV['E2E_NODE_ROLES'] ||
   ["server-0", "server-1", "server-2", "agent-0", "agent-1"])
 NODE_BOXES = (ENV['E2E_NODE_BOXES'] ||
-  ['generic/ubuntu2004', 'generic/ubuntu2004', 'generic/ubuntu2004', 'generic/ubuntu2004', 'generic/ubuntu2004'])
+  ['bento/ubuntu-24.04', 'bento/ubuntu-24.04', 'bento/ubuntu-24.04', 'bento/ubuntu-24.04', 'bento/ubuntu-24.04'])
 GITHUB_BRANCH = (ENV['E2E_GITHUB_BRANCH'] || "master")
 RELEASE_VERSION = (ENV['E2E_RELEASE_VERSION'] || "")
 EXTERNAL_DB = (ENV['E2E_EXTERNAL_DB'] || "etcd")
 HARDENED = (ENV['E2E_HARDENED'] || "")
 REGISTRY = (ENV['E2E_REGISTRY'] || "")
 RANCHER = (ENV['E2E_RANCHER'] || "")
+GOCOVER = (ENV['E2E_GOCOVER'] || "")
 NODE_CPUS = (ENV['E2E_NODE_CPUS'] || 2).to_i
 NODE_MEMORY = (ENV['E2E_NODE_MEMORY'] || 2048).to_i
 # Virtualbox >= 6.1.28 require `/etc/vbox/network.conf` for expanded private networks 
@@ -23,8 +24,8 @@ def provision(vm, role, role_num, node_num)
   node_ip = "#{NETWORK_PREFIX}.#{100+node_num}"
   vm.network "private_network", ip: node_ip, netmask: "255.255.255.0"
 
-  scripts_location = Dir.exists?("./scripts") ? "./scripts" : "../scripts" 
-  vagrant_defaults = File.exists?("./vagrantdefaults.rb") ? "./vagrantdefaults.rb" : "../vagrantdefaults.rb"
+  scripts_location = Dir.exist?("./scripts") ? "./scripts" : "../scripts" 
+  vagrant_defaults = File.exist?("./vagrantdefaults.rb") ? "./vagrantdefaults.rb" : "../vagrantdefaults.rb"
   load vagrant_defaults
 
   defaultOSConfigure(vm)
@@ -38,7 +39,7 @@ def provision(vm, role, role_num, node_num)
   if !REGISTRY.empty?
     vm.provision "Set private registry", type: "shell", path: scripts_location + "/registry.sh", args: [ "#{NETWORK_PREFIX}.1" ]
   end
-  
+  addCoverageDir(vm, role, GOCOVER)
 
   if role.include?("server") && role_num == 0
     vm.provision 'k3s-primary-server', type: 'k3s', run: 'once' do |k3s|
@@ -79,7 +80,6 @@ def provision(vm, role, role_num, node_num)
         node-external-ip: #{node_ip}
         flannel-iface: eth1
         #{db_type}
-        #{hardened_arg}
       YAML
       k3s.env = %W[K3S_KUBECONFIG_MODE=0644 #{install_type}]
       k3s.config_mode = '0644' # side-step https://github.com/k3s-io/k3s/issues/4321
@@ -99,8 +99,18 @@ def provision(vm, role, role_num, node_num)
 end
 
 def getDBType(role, role_num, vm)
-  
-  if EXTERNAL_DB == "mysql"
+
+  if EXTERNAL_DB == "mariadb"
+    if role.include?("server") && role_num == 0
+      dockerInstall(vm)
+      vm.provision "Start mariaDB", inline: "docker run -d -p 3306:3306 --name #{EXTERNAL_DB} -e MARIADB_ROOT_PASSWORD=e2e mariadb:11"
+      vm.provision "shell", inline: "echo \"Wait for mariaDB to startup\"; sleep 10"
+      return "datastore-endpoint: 'mysql://root:e2e@tcp(#{NETWORK_PREFIX}.100:3306)/k3s'"
+    elsif role.include?("server") && role_num != 0
+      return "datastore-endpoint: 'mysql://root:e2e@tcp(#{NETWORK_PREFIX}.100:3306)/k3s'"
+    end
+
+  elsif EXTERNAL_DB == "mysql"
     if role.include?("server") && role_num == 0
       dockerInstall(vm)
       vm.provision "Start mysql", inline: "docker run -d -p 3306:3306 --name #{EXTERNAL_DB} -e MYSQL_ROOT_PASSWORD=e2e mysql:5.7"
@@ -134,11 +144,13 @@ def getDBType(role, role_num, vm)
 end
 
 Vagrant.configure("2") do |config|
-  config.vagrant.plugins = ["vagrant-k3s", "vagrant-reload"]
+  config.vagrant.plugins = ["vagrant-k3s", "vagrant-reload", "vagrant-scp"]
   # Default provider is libvirt, virtualbox is only provided as a backup
   config.vm.provider "libvirt" do |v|
     v.cpus = NODE_CPUS
     v.memory = NODE_MEMORY
+    # We replicate the default prefix, but add a timestamp to enable parallel runs and cleanup of old VMs
+    v.default_prefix = File.basename(Dir.getwd) + "_" + Time.now.to_i.to_s + "_"
   end
   config.vm.provider "virtualbox" do |v|
     v.cpus = NODE_CPUS
@@ -152,13 +164,10 @@ Vagrant.configure("2") do |config|
     NODE_BOXES = NODE_BOXES.split(" ", -1)
   end
 
-  # Must iterate on the index, vagrant does not understand iterating 
-  # over the node roles themselves
-  NODE_ROLES.length.times do |i|
-    name = NODE_ROLES[i]
-    role_num = name.split("-", -1).pop.to_i
-    config.vm.define name do |node|
-      provision(node.vm, name, role_num, i)
+  NODE_ROLES.each_with_index do |role, i|
+    role_num = role.split("-", -1).pop.to_i
+    config.vm.define role do |node|
+      provision(node.vm, role, role_num, i)
     end
   end
 end

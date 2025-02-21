@@ -1,15 +1,20 @@
 package cloudprovider
 
 import (
+	"math/rand"
 	"reflect"
 	"testing"
 
 	core "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
-	addrv4 = "1.2.3.4"
-	addrv6 = "2001:db8::1"
+	addrv4   = "1.2.3.4"
+	addrv4_2 = "2.3.4.5"
+	addrv6   = "2001:db8::1"
+	addrv6_2 = "3001:db8::1"
 )
 
 func Test_UnitFilterByIPFamily(t *testing.T) {
@@ -85,6 +90,72 @@ func Test_UnitFilterByIPFamily(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("filterByIPFamily() = %+v\nWant = %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_UnitFilterByIPFamily_Ordering(t *testing.T) {
+	want := []string{addrv4, addrv4_2, addrv6, addrv6_2}
+	ips := []string{addrv4, addrv4_2, addrv6, addrv6_2}
+	rand.Shuffle(len(ips), func(i, j int) {
+		ips[i], ips[j] = ips[j], ips[i]
+	})
+	svc := &core.Service{
+		Spec: core.ServiceSpec{
+			IPFamilies: []core.IPFamily{core.IPv4Protocol, core.IPv6Protocol},
+		},
+	}
+
+	got, _ := filterByIPFamily(ips, svc)
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("filterByIPFamily() = %+v\nWant = %+v", got, want)
+	}
+}
+
+func Test_UnitGenerateName(t *testing.T) {
+	uid := types.UID("35a5ccb3-4a82-40b7-8d83-cda9582e4251")
+	tests := []struct {
+		name string
+		svc  *core.Service
+		want string
+	}{
+		{
+			name: "Short name",
+			svc: &core.Service{
+				ObjectMeta: meta.ObjectMeta{
+					Name: "a-service",
+					UID:  uid,
+				},
+			},
+			want: "svclb-a-service-35a5ccb3",
+		},
+		{
+			name: "Long name",
+			svc: &core.Service{
+				ObjectMeta: meta.ObjectMeta{
+					Name: "a-service-with-a-very-veeeeeery-long-yet-valid-name",
+					UID:  uid,
+				},
+			},
+			want: "svclb-a-service-with-a-very-veeeeeery-long-yet-valid-n-35a5ccb3",
+		},
+		{
+			name: "Long hypenated name",
+			svc: &core.Service{
+				ObjectMeta: meta.ObjectMeta{
+					Name: "a-service-with-a-name-with-inconvenient------------hypens",
+					UID:  uid,
+				},
+			},
+			want: "svclb-a-service-with-a-name-with-inconvenient-35a5ccb3",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := generateName(tt.svc); got != tt.want {
+				t.Errorf("generateName() = %+v\nWant = %+v", got, tt.want)
 			}
 		})
 	}

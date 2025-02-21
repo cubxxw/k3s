@@ -5,6 +5,7 @@ package cridockerd
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime/debug"
 	"strings"
@@ -34,10 +35,15 @@ func Run(ctx context.Context, cfg *config.Node) error {
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
-				logrus.Fatalf("cri-dockerd panic: %s", debug.Stack())
+				logrus.WithField("stack", string(debug.Stack())).Fatalf("cri-dockerd panic: %v", err)
 			}
 		}()
-		logrus.Fatalf("cri-dockerd exited: %v", command.ExecuteContext(ctx))
+		err := command.ExecuteContext(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logrus.Errorf("cri-dockerd exited: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}()
 
 	return cri.WaitForService(ctx, cfg.CRIDockerd.Address, "cri-dockerd")
@@ -47,6 +53,7 @@ func getDockerCRIArgs(cfg *config.Node) []string {
 	argsMap := map[string]string{
 		"container-runtime-endpoint": cfg.CRIDockerd.Address,
 		"cri-dockerd-root-directory": cfg.CRIDockerd.Root,
+		"streaming-bind-addr":        "127.0.0.1:10010",
 	}
 
 	if dualNode, _ := utilsnet.IsDualStackIPs(cfg.AgentConfig.NodeIPs); dualNode {

@@ -32,6 +32,7 @@ var (
 	enableIPv6Env      = "K3S_ROOTLESS_ENABLE_IPV6"
 	portDriverEnv      = "K3S_ROOTLESS_PORT_DRIVER"
 	disableLoopbackEnv = "K3S_ROOTLESS_DISABLE_HOST_LOOPBACK"
+	copyUpDirsEnv      = "K3S_ROOTLESS_COPYUPDIRS"
 )
 
 func Rootless(stateDir string, enableIPv6 bool) error {
@@ -132,11 +133,6 @@ func createParentOpt(driver portDriver, stateDir string, enableIPv6 bool) (*pare
 		return nil, errors.Wrapf(err, "failed to mkdir %s", stateDir)
 	}
 
-	stateDir, err := os.MkdirTemp("", "rootless")
-	if err != nil {
-		return nil, err
-	}
-
 	driver.SetStateDir(stateDir)
 
 	opt := &parent.Opt{
@@ -223,6 +219,9 @@ func createChildOpt(driver portDriver) (*child.Opt, error) {
 	opt.NetworkDriver = slirp4netns.NewChildDriver()
 	opt.PortDriver = driver.NewChildDriver()
 	opt.CopyUpDirs = []string{"/etc", "/var/run", "/run", "/var/lib"}
+	if copyUpDirs := os.Getenv(copyUpDirsEnv); copyUpDirs != "" {
+		opt.CopyUpDirs = append(opt.CopyUpDirs, strings.Split(copyUpDirs, ",")...)
+	}
 	opt.CopyUpDriver = tmpfssymlink.NewChildDriver()
 	opt.MountProcfs = true
 	opt.Reaper = true

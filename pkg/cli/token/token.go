@@ -1,10 +1,12 @@
 package token
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -12,16 +14,20 @@ import (
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
 	"github.com/k3s-io/k3s/pkg/clientaccess"
 	"github.com/k3s-io/k3s/pkg/kubeadm"
+	"github.com/k3s-io/k3s/pkg/proctitle"
+	"github.com/k3s-io/k3s/pkg/server"
+	"github.com/k3s-io/k3s/pkg/server/handlers"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 	"gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/duration"
-	"k8s.io/client-go/tools/clientcmd"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	bootstraputil "k8s.io/cluster-bootstrap/token/util"
+	"k8s.io/utils/ptr"
 )
 
 func Create(app *cli.Context) error {
@@ -42,7 +48,7 @@ func create(app *cli.Context, cfg *cmds.Token) error {
 		return err
 	}
 
-	restConfig, err := clientcmd.BuildConfigFromFlags("", cfg.Kubeconfig)
+	restConfig, err := util.GetRESTConfig(cfg.Kubeconfig)
 	if err != nil {
 		return err
 	}
@@ -137,6 +143,50 @@ func generate(app *cli.Context, cfg *cmds.Token) error {
 	}
 	fmt.Println(token)
 	return nil
+}
+
+func Rotate(app *cli.Context) error {
+	if err := cmds.InitLogging(); err != nil {
+		return err
+	}
+	fmt.Println("\033[33mWARNING\033[0m: Recommended to keep a record of the old token. If restoring from a snapshot, you must use the token associated with that snapshot.")
+	info, err := serverAccess(&cmds.TokenConfig)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(handlers.TokenRotateRequest{
+		NewToken: ptr.To(cmds.TokenConfig.NewToken),
+	})
+	if err != nil {
+		return err
+	}
+	if err = info.Put("/v1-"+version.Program+"/token", b); err != nil {
+		return err
+	}
+	// wait for etcd db propagation delay
+	time.Sleep(1 * time.Second)
+	fmt.Println("Token rotated, restart", version.Program, "nodes with new token")
+	return nil
+}
+
+func serverAccess(cfg *cmds.Token) (*clientaccess.Info, error) {
+	// hide process arguments from ps output, since they likely contain tokens.
+	proctitle.SetProcTitle(os.Args[0] + " token")
+
+	dataDir, err := server.ResolveDataDir("")
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Token == "" {
+		fp := filepath.Join(dataDir, "token")
+		tokenByte, err := os.ReadFile(fp)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Token = string(bytes.TrimRight(tokenByte, "\n"))
+	}
+	return clientaccess.ParseAndValidateToken(cfg.ServerURL, cfg.Token, clientaccess.WithUser("server"))
 }
 
 func List(app *cli.Context) error {

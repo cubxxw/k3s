@@ -22,8 +22,19 @@ var EtcdSnapshotFlags = []cli.Flag{
 	},
 	DataDirFlag,
 	&cli.StringFlag{
+		Name:        "etcd-token,t",
+		Usage:       "(cluster) Shared secret used to authenticate to etcd server",
+		Destination: &ServerConfig.Token,
+	},
+	&cli.StringFlag{
+		Name:        "etcd-server, s",
+		Usage:       "(cluster) Server with etcd role to connect to for snapshot management operations",
+		Value:       "https://127.0.0.1:6443",
+		Destination: &ServerConfig.ServerURL,
+	},
+	&cli.StringFlag{
 		Name:        "dir,etcd-snapshot-dir",
-		Usage:       "(db) Directory to save etcd on-demand snapshot. (default: ${data-dir}/db/snapshots)",
+		Usage:       "(db) Directory to save etcd on-demand snapshot. (default: ${data-dir}/server/db/snapshots)",
 		Destination: &ServerConfig.EtcdSnapshotDir,
 	},
 	&cli.StringFlag{
@@ -36,6 +47,12 @@ var EtcdSnapshotFlags = []cli.Flag{
 		Name:        "snapshot-compress,etcd-snapshot-compress",
 		Usage:       "(db) Compress etcd snapshot",
 		Destination: &ServerConfig.EtcdSnapshotCompress,
+	},
+	&cli.IntFlag{
+		Name:        "snapshot-retention,etcd-snapshot-retention",
+		Usage:       "(db) Number of snapshots to retain.",
+		Destination: &ServerConfig.EtcdSnapshotRetention,
+		Value:       defaultSnapshotRentention,
 	},
 	&cli.BoolFlag{
 		Name:        "s3,etcd-s3",
@@ -71,6 +88,12 @@ var EtcdSnapshotFlags = []cli.Flag{
 		Destination: &ServerConfig.EtcdS3SecretKey,
 	},
 	&cli.StringFlag{
+		Name:        "s3-session-token,etcd-s3-session-token",
+		Usage:       "(db) S3 session token",
+		EnvVar:      "AWS_SESSION_TOKEN",
+		Destination: &ServerConfig.EtcdS3SessionToken,
+	},
+	&cli.StringFlag{
 		Name:        "s3-bucket,etcd-s3-bucket",
 		Usage:       "(db) S3 bucket name",
 		Destination: &ServerConfig.EtcdS3BucketName,
@@ -86,6 +109,16 @@ var EtcdSnapshotFlags = []cli.Flag{
 		Usage:       "(db) S3 folder",
 		Destination: &ServerConfig.EtcdS3Folder,
 	},
+	&cli.StringFlag{
+		Name:        "s3-proxy,etcd-s3-proxy",
+		Usage:       "(db) Proxy server to use when connecting to S3, overriding any proxy-releated environment variables",
+		Destination: &ServerConfig.EtcdS3Proxy,
+	},
+	&cli.StringFlag{
+		Name:        "s3-config-secret,etcd-s3-config-secret",
+		Usage:       "(db) Name of secret in the kube-system namespace used to configure S3, if etcd-s3 is enabled and no other etcd-s3 options are set",
+		Destination: &ServerConfig.EtcdS3ConfigSecret,
+	},
 	&cli.BoolFlag{
 		Name:        "s3-insecure,etcd-s3-insecure",
 		Usage:       "(db) Disables S3 over HTTPS",
@@ -99,14 +132,20 @@ var EtcdSnapshotFlags = []cli.Flag{
 	},
 }
 
-func NewEtcdSnapshotCommands(run, delete, list, prune, save func(ctx *cli.Context) error) cli.Command {
+func NewEtcdSnapshotCommands(delete, list, prune, save func(ctx *cli.Context) error) cli.Command {
 	return cli.Command{
 		Name:            EtcdSnapshotCommand,
-		Usage:           "Trigger an immediate etcd snapshot",
 		SkipFlagParsing: false,
 		SkipArgReorder:  true,
-		Action:          run,
 		Subcommands: []cli.Command{
+			{
+				Name:            "save",
+				Usage:           "Trigger an immediate etcd snapshot",
+				SkipFlagParsing: false,
+				SkipArgReorder:  true,
+				Action:          save,
+				Flags:           EtcdSnapshotFlags,
+			},
 			{
 				Name:            "delete",
 				Usage:           "Delete given snapshot(s)",
@@ -134,19 +173,6 @@ func NewEtcdSnapshotCommands(run, delete, list, prune, save func(ctx *cli.Contex
 				SkipFlagParsing: false,
 				SkipArgReorder:  true,
 				Action:          prune,
-				Flags: append(EtcdSnapshotFlags, &cli.IntFlag{
-					Name:        "snapshot-retention",
-					Usage:       "(db) Number of snapshots to retain.",
-					Destination: &ServerConfig.EtcdSnapshotRetention,
-					Value:       defaultSnapshotRentention,
-				}),
-			},
-			{
-				Name:            "save",
-				Usage:           "Trigger an immediate etcd snapshot",
-				SkipFlagParsing: false,
-				SkipArgReorder:  true,
-				Action:          save,
 				Flags:           EtcdSnapshotFlags,
 			},
 		},

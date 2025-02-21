@@ -2,11 +2,14 @@
 
 set -e
 
+. ./scripts/version.sh
+
+GO=${GO-go}
+ARCH=${ARCH:-$("${GO}" env GOARCH)}
+
 if [ "${DEBUG}" = 1 ]; then
     set -x
 fi
-
-. ./scripts/version.sh
 
 # Try to keep the K3s binary under 70 megabytes.
 # "64M ought to be enough for anybody"
@@ -21,7 +24,7 @@ elif [ ${ARCH} = s390x ]; then
     BIN_SUFFIX="-s390x"
 fi
 
-CMD_NAME="dist/artifacts/k3s${BIN_SUFFIX}"
+CMD_NAME="dist/artifacts/k3s${BIN_SUFFIX}${BINARY_POSTFIX}"
 SIZE=$(stat -c '%s' ${CMD_NAME})
 
 if [ -n "${DEBUG}" ]; then

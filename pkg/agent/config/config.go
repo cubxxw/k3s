@@ -2,9 +2,11 @@ package config
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -16,22 +18,28 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/k3s-io/k3s/pkg/agent/containerd"
 	"github.com/k3s-io/k3s/pkg/agent/proxy"
 	agentutil "github.com/k3s-io/k3s/pkg/agent/util"
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
 	"github.com/k3s-io/k3s/pkg/clientaccess"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/daemons/control/deps"
+	"github.com/k3s-io/k3s/pkg/spegel"
 	"github.com/k3s-io/k3s/pkg/util"
 	"github.com/k3s-io/k3s/pkg/version"
+	"github.com/k3s-io/k3s/pkg/vpn"
 	"github.com/pkg/errors"
-	"github.com/rancher/wrangler/pkg/slice"
+	certutil "github.com/rancher/dynamiclistener/cert"
+	"github.com/rancher/wharfie/pkg/registries"
+	"github.com/rancher/wrangler/v3/pkg/slice"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/wait"
+	utilsnet "k8s.io/utils/net"
 )
 
 const (
@@ -40,22 +48,30 @@ const (
 
 // Get returns a pointer to a completed Node configuration struct,
 // containing a merging of the local CLI configuration with settings from the server.
+// Node configuration includes client certificates, which requires node password verification,
+// so this is somewhat computationally expensive on the server side, and is retried with jitter
+// to avoid having clients hammer on the server at fixed periods.
 // A call to this will bock until agent configuration is successfully returned by the
-// server.
-func Get(ctx context.Context, agent cmds.Agent, proxy proxy.Proxy) *config.Node {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-RETRY:
-	for {
-		agentConfig, err := get(ctx, &agent, proxy)
+// server, or the context is cancelled.
+func Get(ctx context.Context, agent cmds.Agent, proxy proxy.Proxy) (*config.Node, error) {
+	var agentConfig *config.Node
+	var err error
+
+	// This would be more clear as wait.PollImmediateUntilWithContext, but that function
+	// does not support jittering, so we instead use wait.JitterUntilWithContext, and cancel
+	// the context on success.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	wait.JitterUntilWithContext(ctx, func(ctx context.Context) {
+		agentConfig, err = get(ctx, &agent, proxy)
 		if err != nil {
 			logrus.Infof("Waiting to retrieve agent configuration; server is not ready: %v", err)
-			for range ticker.C {
-				continue RETRY
-			}
+		} else {
+			cancel()
 		}
-		return agentConfig
-	}
+	}, 5*time.Second, 1.0, true)
+	return agentConfig, err
 }
 
 // KubeProxyDisabled returns a bool indicating whether or not kube-proxy has been disabled in the
@@ -63,42 +79,49 @@ RETRY:
 // after all startup hooks have completed, so a call to this will block until after the server's
 // readyz endpoint returns OK.
 func KubeProxyDisabled(ctx context.Context, node *config.Node, proxy proxy.Proxy) bool {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-RETRY:
-	for {
-		disabled, err := getKubeProxyDisabled(ctx, node, proxy)
+	var disabled bool
+	var err error
+
+	_ = wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		disabled, err = getKubeProxyDisabled(ctx, node, proxy)
 		if err != nil {
 			logrus.Infof("Waiting to retrieve kube-proxy configuration; server is not ready: %v", err)
-			for range ticker.C {
-				continue RETRY
-			}
+			return false, nil
 		}
-		return disabled
-	}
+		return true, nil
+	})
+	return disabled
 }
 
-// APIServers returns a list of apiserver endpoints, suitable for seeding client loadbalancer configurations.
+// WaitForAPIServers returns a list of apiserver endpoints, suitable for seeding client loadbalancer configurations.
 // This function will block until it can return a populated list of apiservers, or if the remote server returns
 // an error (indicating that it does not support this functionality).
-func APIServers(ctx context.Context, node *config.Node, proxy proxy.Proxy) []string {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-RETRY:
-	for {
-		addresses, err := getAPIServers(ctx, node, proxy)
-		if err != nil {
-			logrus.Infof("Failed to retrieve list of apiservers from server: %v", err)
-			return nil
-		}
-		if len(addresses) == 0 {
-			logrus.Infof("Waiting for apiserver addresses")
-			for range ticker.C {
-				continue RETRY
+func WaitForAPIServers(ctx context.Context, node *config.Node, proxy proxy.Proxy) []string {
+	var addresses []string
+	var info *clientaccess.Info
+	var err error
+
+	_ = wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		if info == nil {
+			withCert := clientaccess.WithClientCertificate(node.AgentConfig.ClientKubeletCert, node.AgentConfig.ClientKubeletKey)
+			info, err = clientaccess.ParseAndValidateToken(proxy.SupervisorURL(), node.Token, withCert)
+			if err != nil {
+				logrus.Warnf("Failed to validate server token: %v", err)
+				return false, nil
 			}
 		}
-		return addresses
-	}
+		addresses, err = GetAPIServers(ctx, info)
+		if err != nil {
+			logrus.Infof("Failed to retrieve list of apiservers from server: %v", err)
+			return false, err
+		}
+		if len(addresses) == 0 {
+			logrus.Infof("Waiting for supervisor to provide apiserver addresses")
+			return false, nil
+		}
+		return true, nil
+	})
+	return addresses
 }
 
 type HTTPRequester func(u string, client *http.Client, username, password, token string) ([]byte, error)
@@ -112,9 +135,9 @@ func Request(path string, info *clientaccess.Info, requester HTTPRequester) ([]b
 	return requester(u.String(), clientaccess.GetHTTPClient(info.CACerts, info.CertFile, info.KeyFile), info.Username, info.Password, info.Token())
 }
 
-func getNodeNamedCrt(nodeName string, nodeIPs []net.IP, nodePasswordFile string) HTTPRequester {
+func getNodeNamedCrt(nodeName string, nodeIPs []net.IP, nodePasswordFile string, csr []byte) HTTPRequester {
 	return func(u string, client *http.Client, username, password, token string) ([]byte, error) {
-		req, err := http.NewRequest(http.MethodGet, u, nil)
+		req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(csr))
 		if err != nil {
 			return nil, err
 		}
@@ -138,6 +161,20 @@ func getNodeNamedCrt(nodeName string, nodeIPs []net.IP, nodePasswordFile string)
 			return nil, err
 		}
 		defer resp.Body.Close()
+
+		// If we got a 401 Unauthorized response when using client certs, try again without client cert auth.
+		// This allows us to fall back from node identity to token when the node resource is deleted.
+		if resp.StatusCode == http.StatusUnauthorized {
+			if transport, ok := client.Transport.(*http.Transport); ok && transport.TLSClientConfig != nil && len(transport.TLSClientConfig.Certificates) != 0 {
+				logrus.Infof("Node authorization rejected, retrying without client certificate authentication")
+				transport.TLSClientConfig.Certificates = []tls.Certificate{}
+				resp, err = client.Do(req)
+				if err != nil {
+					return nil, err
+				}
+				defer resp.Body.Close()
+			}
+		}
 
 		if resp.StatusCode == http.StatusForbidden {
 			return nil, fmt.Errorf("Node password rejected, duplicate hostname or contents of '%s' may not match server node-passwd entry, try enabling a unique node name with the --with-node-id flag", nodePasswordFile)
@@ -176,7 +213,16 @@ func ensureNodePassword(nodePasswordFile string) (string, error) {
 		return "", err
 	}
 	nodePassword := hex.EncodeToString(password)
-	return nodePassword, os.WriteFile(nodePasswordFile, []byte(nodePassword+"\n"), 0600)
+
+	if err = os.WriteFile(nodePasswordFile, []byte(nodePassword+"\n"), 0600); err != nil {
+		return nodePassword, err
+	}
+
+	if err = configureACL(nodePasswordFile); err != nil {
+		return nodePassword, err
+	}
+
+	return nodePassword, nil
 }
 
 func upgradeOldNodePasswordPath(oldNodePasswordFile, newNodePasswordFile string) {
@@ -194,49 +240,91 @@ func upgradeOldNodePasswordPath(oldNodePasswordFile, newNodePasswordFile string)
 	}
 }
 
-func getServingCert(nodeName string, nodeIPs []net.IP, servingCertFile, servingKeyFile, nodePasswordFile string, info *clientaccess.Info) (*tls.Certificate, error) {
-	servingCert, err := Request("/v1-"+version.Program+"/serving-kubelet.crt", info, getNodeNamedCrt(nodeName, nodeIPs, nodePasswordFile))
+// getKubeletServingCert fills the kubelet server certificate with content returned
+// from the server.  We attempt to POST a CSR to the server, in hopes that it will
+// sign the cert using our locally generated key. If the server does not support CSR
+// signing, the key generated by the server is used instead.
+func getKubeletServingCert(nodeName string, nodeIPs []net.IP, certFile, keyFile, nodePasswordFile string, info *clientaccess.Info) error {
+	csr, err := getCSRBytes(keyFile)
 	if err != nil {
-		return nil, err
+		return errors.Wrapf(err, "failed to create certificate request %s", certFile)
 	}
 
-	servingCert, servingKey := splitCertKeyPEM(servingCert)
-
-	if err := os.WriteFile(servingCertFile, servingCert, 0600); err != nil {
-		return nil, errors.Wrapf(err, "failed to write node cert")
-	}
-
-	if err := os.WriteFile(servingKeyFile, servingKey, 0600); err != nil {
-		return nil, errors.Wrapf(err, "failed to write node key")
-	}
-
-	cert, err := tls.X509KeyPair(servingCert, servingKey)
+	basename := filepath.Base(certFile)
+	body, err := Request("/v1-"+version.Program+"/"+basename, info, getNodeNamedCrt(nodeName, nodeIPs, nodePasswordFile, csr))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &cert, nil
+
+	// Always split the response, as down-level servers may send back a cert+key
+	// instead of signing a new cert with our key.  If the response includes a key it
+	// must be used instead of the one we signed the CSR with.
+	certBytes, keyBytes := splitCertKeyPEM(body)
+	if err := os.WriteFile(certFile, certBytes, 0600); err != nil {
+		return errors.Wrapf(err, "failed to write cert %s", certFile)
+	}
+	if len(keyBytes) > 0 {
+		if err := os.WriteFile(keyFile, keyBytes, 0600); err != nil {
+			return errors.Wrapf(err, "failed to write key %s", keyFile)
+		}
+	}
+	return nil
 }
 
-func getHostFile(filename, keyFile string, info *clientaccess.Info) error {
+// getHostFile fills a file with content returned from the server.
+func getHostFile(filename string, info *clientaccess.Info) error {
 	basename := filepath.Base(filename)
 	fileBytes, err := info.Get("/v1-" + version.Program + "/" + basename)
 	if err != nil {
 		return err
 	}
-	if keyFile == "" {
-		if err := os.WriteFile(filename, fileBytes, 0600); err != nil {
-			return errors.Wrapf(err, "failed to write cert %s", filename)
-		}
-	} else {
-		fileBytes, keyBytes := splitCertKeyPEM(fileBytes)
-		if err := os.WriteFile(filename, fileBytes, 0600); err != nil {
-			return errors.Wrapf(err, "failed to write cert %s", filename)
-		}
+	if err := os.WriteFile(filename, fileBytes, 0600); err != nil {
+		return errors.Wrapf(err, "failed to write cert %s", filename)
+	}
+	return nil
+}
+
+// getClientCert fills a client certificate with content returned from the server.
+// We attempt to POST a CSR to the server, in hopes that it will sign the cert using
+// our locally generated key. If the server does not support CSR signing, the key
+// generated by the server is used instead.
+func getClientCert(certFile, keyFile string, info *clientaccess.Info) error {
+	csr, err := getCSRBytes(keyFile)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create certificate request %s", certFile)
+	}
+
+	basename := filepath.Base(certFile)
+	fileBytes, err := info.Post("/v1-"+version.Program+"/"+basename, csr)
+	if err != nil {
+		return err
+	}
+
+	// Always split the response, as down-level servers may send back a cert+key
+	// instead of signing a new cert with our key.  If the response includes a key it
+	// must be used instead of the one we signed the CSR with.
+	certBytes, keyBytes := splitCertKeyPEM(fileBytes)
+	if err := os.WriteFile(certFile, certBytes, 0600); err != nil {
+		return errors.Wrapf(err, "failed to write cert %s", certFile)
+	}
+	if len(keyBytes) > 0 {
 		if err := os.WriteFile(keyFile, keyBytes, 0600); err != nil {
-			return errors.Wrapf(err, "failed to write key %s", filename)
+			return errors.Wrapf(err, "failed to write key %s", keyFile)
 		}
 	}
 	return nil
+}
+
+func getCSRBytes(keyFile string) ([]byte, error) {
+	keyBytes, _, err := certutil.LoadOrGenerateKeyFile(keyFile, false)
+	if err != nil {
+		return nil, err
+	}
+	key, err := certutil.ParsePrivateKeyPEM(keyBytes)
+	if err != nil {
+		return nil, err
+	}
+	return x509.CreateCertificateRequest(cryptorand.Reader, &x509.CertificateRequest{}, key)
 }
 
 func splitCertKeyPEM(bytes []byte) (certPem []byte, keyPem []byte) {
@@ -257,19 +345,33 @@ func splitCertKeyPEM(bytes []byte) (certPem []byte, keyPem []byte) {
 	return
 }
 
-func getNodeNamedHostFile(filename, keyFile, nodeName string, nodeIPs []net.IP, nodePasswordFile string, info *clientaccess.Info) error {
-	basename := filepath.Base(filename)
-	fileBytes, err := Request("/v1-"+version.Program+"/"+basename, info, getNodeNamedCrt(nodeName, nodeIPs, nodePasswordFile))
+// getKubeletClientCert fills the kubelet client certificate with content returned
+// from the server.  We attempt to POST a CSR to the server, in hopes that it will
+// sign the cert using our locally generated key. If the server does not support CSR
+// signing, the key generated by the server is used instead.
+func getKubeletClientCert(certFile, keyFile, nodeName string, nodeIPs []net.IP, nodePasswordFile string, info *clientaccess.Info) error {
+	csr, err := getCSRBytes(keyFile)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create certificate request %s", certFile)
+	}
+
+	basename := filepath.Base(certFile)
+	body, err := Request("/v1-"+version.Program+"/"+basename, info, getNodeNamedCrt(nodeName, nodeIPs, nodePasswordFile, csr))
 	if err != nil {
 		return err
 	}
-	fileBytes, keyBytes := splitCertKeyPEM(fileBytes)
 
-	if err := os.WriteFile(filename, fileBytes, 0600); err != nil {
-		return errors.Wrapf(err, "failed to write cert %s", filename)
+	// Always split the response, as down-level servers may send back a cert+key
+	// instead of signing a new cert with our key.  If the response includes a key it
+	// must be used instead of the one we signed the CSR with.
+	certBytes, keyBytes := splitCertKeyPEM(body)
+	if err := os.WriteFile(certFile, certBytes, 0600); err != nil {
+		return errors.Wrapf(err, "failed to write cert %s", certFile)
 	}
-	if err := os.WriteFile(keyFile, keyBytes, 0600); err != nil {
-		return errors.Wrapf(err, "failed to write key %s", filename)
+	if len(keyBytes) > 0 {
+		if err := os.WriteFile(keyFile, keyBytes, 0600); err != nil {
+			return errors.Wrapf(err, "failed to write key %s", keyFile)
+		}
 	}
 	return nil
 }
@@ -283,19 +385,22 @@ func isValidResolvConf(resolvConfFile string) bool {
 
 	nameserver := regexp.MustCompile(`^nameserver\s+([^\s]*)`)
 	scanner := bufio.NewScanner(file)
+	foundNameserver := false
 	for scanner.Scan() {
 		ipMatch := nameserver.FindStringSubmatch(scanner.Text())
 		if len(ipMatch) == 2 {
 			ip := net.ParseIP(ipMatch[1])
 			if ip == nil || !ip.IsGlobalUnicast() {
 				return false
+			} else {
+				foundNameserver = true
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return false
 	}
-	return true
+	return foundNameserver
 }
 
 func locateOrGenerateResolvConf(envInfo *cmds.Agent) string {
@@ -334,30 +439,30 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to retrieve configuration from server")
 	}
-
 	// If the supervisor and externally-facing apiserver are not on the same port, tell the proxy where to find the apiserver.
 	if controlConfig.SupervisorPort != controlConfig.HTTPSPort {
-		_, isIPv6, _ := util.GetFirstString([]string{envInfo.NodeIP.String()})
-		if err := proxy.SetAPIServerPort(ctx, controlConfig.HTTPSPort, isIPv6); err != nil {
-			return nil, errors.Wrapf(err, "failed to setup access to API Server port %d on at %s", controlConfig.HTTPSPort, proxy.SupervisorURL())
+		isIPv6 := utilsnet.IsIPv6(net.ParseIP(util.GetFirstValidIPString(envInfo.NodeIP)))
+		if err := proxy.SetAPIServerPort(controlConfig.HTTPSPort, isIPv6); err != nil {
+			return nil, errors.Wrapf(err, "failed to set apiserver port to %d", controlConfig.HTTPSPort)
 		}
 	}
+	apiServerURL := proxy.APIServerURL()
 
 	var flannelIface *net.Interface
 	if controlConfig.FlannelBackend != config.FlannelBackendNone && len(envInfo.FlannelIface) > 0 {
 		flannelIface, err = net.InterfaceByName(envInfo.FlannelIface)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to find interface")
+			return nil, errors.Wrapf(err, "unable to find interface %s", envInfo.FlannelIface)
 		}
 	}
 
 	clientCAFile := filepath.Join(envInfo.DataDir, "agent", "client-ca.crt")
-	if err := getHostFile(clientCAFile, "", info); err != nil {
+	if err := getHostFile(clientCAFile, info); err != nil {
 		return nil, err
 	}
 
 	serverCAFile := filepath.Join(envInfo.DataDir, "agent", "server-ca.crt")
-	if err := getHostFile(serverCAFile, "", info); err != nil {
+	if err := getHostFile(serverCAFile, info); err != nil {
 		return nil, err
 	}
 
@@ -382,6 +487,55 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		return nil, err
 	}
 
+	// If there is a VPN, we must overwrite NodeIP and flannel interface
+	var vpnInfo vpn.VPNInfo
+	if envInfo.VPNAuth != "" {
+		vpnInfo, err = vpn.GetVPNInfo(envInfo.VPNAuth)
+		if err != nil {
+			return nil, err
+		}
+
+		// Pass ipv4, ipv6 or both depending on nodeIPs mode
+		var vpnIPs []net.IP
+		if utilsnet.IsIPv4(nodeIPs[0]) && vpnInfo.IPv4Address != nil {
+			vpnIPs = append(vpnIPs, vpnInfo.IPv4Address)
+			if vpnInfo.IPv6Address != nil {
+				vpnIPs = append(vpnIPs, vpnInfo.IPv6Address)
+			}
+		} else if utilsnet.IsIPv6(nodeIPs[0]) && vpnInfo.IPv6Address != nil {
+			vpnIPs = append(vpnIPs, vpnInfo.IPv6Address)
+			if vpnInfo.IPv4Address != nil {
+				vpnIPs = append(vpnIPs, vpnInfo.IPv4Address)
+			}
+		} else {
+			return nil, errors.Errorf("address family mismatch when assigning VPN addresses to node: node=%v, VPN ipv4=%v ipv6=%v", nodeIPs, vpnInfo.IPv4Address, vpnInfo.IPv6Address)
+		}
+
+		// Overwrite nodeip and flannel interface and throw a warning if user explicitly set those parameters
+		if len(vpnIPs) != 0 {
+			logrus.Infof("Node-ip changed to %v due to VPN", vpnIPs)
+			if len(envInfo.NodeIP) != 0 {
+				logrus.Warn("VPN provider overrides configured node-ip parameter")
+			}
+			if len(envInfo.NodeExternalIP) != 0 {
+				logrus.Warn("VPN provider overrides node-external-ip parameter")
+			}
+			nodeIPs = vpnIPs
+			flannelIface, err = net.InterfaceByName(vpnInfo.VPNInterface)
+			if err != nil {
+				return nil, errors.Wrapf(err, "unable to find vpn interface: %s", vpnInfo.VPNInterface)
+			}
+		}
+	}
+
+	if controlConfig.ClusterIPRange != nil {
+		if utilsnet.IPFamilyOfCIDR(controlConfig.ClusterIPRange) != utilsnet.IPFamilyOf(nodeIPs[0]) && len(nodeIPs) > 1 {
+			firstNodeIP := nodeIPs[0]
+			nodeIPs[0] = nodeIPs[1]
+			nodeIPs[1] = firstNodeIP
+		}
+	}
+
 	nodeExternalIPs, err := util.ParseStringSliceToIPs(envInfo.NodeExternalIP)
 	if err != nil {
 		return nil, fmt.Errorf("invalid node-external-ip: %w", err)
@@ -397,40 +551,58 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 
 	os.Setenv("NODE_NAME", nodeName)
 
+	// Ensure that the kubelet's server certificate is valid for all configured node IPs.  Note
+	// that in the case of an external CCM, additional IPs may be added by the infra provider
+	// that the cert will not be valid for, as they are not present in the list collected here.
 	nodeExternalAndInternalIPs := append(nodeIPs, nodeExternalIPs...)
-	servingCert, err := getServingCert(nodeName, nodeExternalAndInternalIPs, servingKubeletCert, servingKubeletKey, newNodePasswordFile, info)
-	if err != nil {
-		return nil, err
+
+	// Ask the server to sign our kubelet server cert.
+	if err := getKubeletServingCert(nodeName, nodeExternalAndInternalIPs, servingKubeletCert, servingKubeletKey, newNodePasswordFile, info); err != nil {
+		return nil, errors.Wrap(err, servingKubeletCert)
 	}
 
-	if err := getNodeNamedHostFile(clientKubeletCert, clientKubeletKey, nodeName, nodeIPs, newNodePasswordFile, info); err != nil {
-		return nil, err
+	// Ask the server to sign our kubelet client cert.
+	if err := getKubeletClientCert(clientKubeletCert, clientKubeletKey, nodeName, nodeIPs, newNodePasswordFile, info); err != nil {
+		return nil, errors.Wrap(err, clientKubeletCert)
 	}
 
+	// Generate a kubeconfig for the kubelet.
 	kubeconfigKubelet := filepath.Join(envInfo.DataDir, "agent", "kubelet.kubeconfig")
-	if err := deps.KubeConfig(kubeconfigKubelet, proxy.APIServerURL(), serverCAFile, clientKubeletCert, clientKubeletKey); err != nil {
+	if err := deps.KubeConfig(kubeconfigKubelet, apiServerURL, serverCAFile, clientKubeletCert, clientKubeletKey); err != nil {
 		return nil, err
 	}
 
 	clientKubeProxyCert := filepath.Join(envInfo.DataDir, "agent", "client-kube-proxy.crt")
 	clientKubeProxyKey := filepath.Join(envInfo.DataDir, "agent", "client-kube-proxy.key")
-	if err := getHostFile(clientKubeProxyCert, clientKubeProxyKey, info); err != nil {
-		return nil, err
+
+	// Ask the server to sign our kube-proxy client cert.
+	if err := getClientCert(clientKubeProxyCert, clientKubeProxyKey, info); err != nil {
+		return nil, errors.Wrap(err, clientKubeProxyCert)
 	}
 
+	// Generate a kubeconfig for kube-proxy.
 	kubeconfigKubeproxy := filepath.Join(envInfo.DataDir, "agent", "kubeproxy.kubeconfig")
-	if err := deps.KubeConfig(kubeconfigKubeproxy, proxy.APIServerURL(), serverCAFile, clientKubeProxyCert, clientKubeProxyKey); err != nil {
+	if err := deps.KubeConfig(kubeconfigKubeproxy, apiServerURL, serverCAFile, clientKubeProxyCert, clientKubeProxyKey); err != nil {
 		return nil, err
 	}
 
 	clientK3sControllerCert := filepath.Join(envInfo.DataDir, "agent", "client-"+version.Program+"-controller.crt")
 	clientK3sControllerKey := filepath.Join(envInfo.DataDir, "agent", "client-"+version.Program+"-controller.key")
-	if err := getHostFile(clientK3sControllerCert, clientK3sControllerKey, info); err != nil {
+
+	// Ask the server to sign our agent controller client cert.
+	if err := getClientCert(clientK3sControllerCert, clientK3sControllerKey, info); err != nil {
+		return nil, errors.Wrap(err, clientK3sControllerCert)
+	}
+
+	// Generate a kubeconfig for the agent controller.
+	kubeconfigK3sController := filepath.Join(envInfo.DataDir, "agent", version.Program+"controller.kubeconfig")
+	if err := deps.KubeConfig(kubeconfigK3sController, apiServerURL, serverCAFile, clientK3sControllerCert, clientK3sControllerKey); err != nil {
 		return nil, err
 	}
 
-	kubeconfigK3sController := filepath.Join(envInfo.DataDir, "agent", version.Program+"controller.kubeconfig")
-	if err := deps.KubeConfig(kubeconfigK3sController, proxy.APIServerURL(), serverCAFile, clientK3sControllerCert, clientK3sControllerKey); err != nil {
+	// Ensure kubelet config dir exists
+	kubeletConfigDir := filepath.Join(envInfo.DataDir, "agent", "etc", "kubelet.conf.d")
+	if err := os.MkdirAll(kubeletConfigDir, 0700); err != nil {
 		return nil, err
 	}
 
@@ -438,12 +610,16 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		Docker:                   envInfo.Docker,
 		SELinux:                  envInfo.EnableSELinux,
 		ContainerRuntimeEndpoint: envInfo.ContainerRuntimeEndpoint,
-		MultiClusterCIDR:         controlConfig.MultiClusterCIDR,
+		ImageServiceEndpoint:     envInfo.ImageServiceEndpoint,
+		EnablePProf:              envInfo.EnablePProf,
+		EmbeddedRegistry:         controlConfig.EmbeddedRegistry,
 		FlannelBackend:           controlConfig.FlannelBackend,
 		FlannelIPv6Masq:          controlConfig.FlannelIPv6Masq,
 		FlannelExternalIP:        controlConfig.FlannelExternalIP,
 		EgressSelectorMode:       controlConfig.EgressSelectorMode,
 		ServerHTTPSPort:          controlConfig.HTTPSPort,
+		SupervisorPort:           controlConfig.SupervisorPort,
+		SupervisorMetrics:        controlConfig.SupervisorMetrics,
 		Token:                    info.String(),
 	}
 	nodeConfig.FlannelIface = flannelIface
@@ -458,63 +634,58 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	nodeConfig.AgentConfig.ClusterDomain = controlConfig.ClusterDomain
 	nodeConfig.AgentConfig.ResolvConf = locateOrGenerateResolvConf(envInfo)
 	nodeConfig.AgentConfig.ClientCA = clientCAFile
+	nodeConfig.AgentConfig.KubeletConfigDir = kubeletConfigDir
 	nodeConfig.AgentConfig.KubeConfigKubelet = kubeconfigKubelet
 	nodeConfig.AgentConfig.KubeConfigKubeProxy = kubeconfigKubeproxy
 	nodeConfig.AgentConfig.KubeConfigK3sController = kubeconfigK3sController
-	if envInfo.Rootless {
-		nodeConfig.AgentConfig.RootDir = filepath.Join(envInfo.DataDir, "agent", "kubelet")
-	}
 	nodeConfig.AgentConfig.Snapshotter = envInfo.Snapshotter
 	nodeConfig.AgentConfig.IPSECPSK = controlConfig.IPSECPSK
 	nodeConfig.Containerd.Config = filepath.Join(envInfo.DataDir, "agent", "etc", "containerd", "config.toml")
 	nodeConfig.Containerd.Root = filepath.Join(envInfo.DataDir, "agent", "containerd")
 	nodeConfig.CRIDockerd.Root = filepath.Join(envInfo.DataDir, "agent", "cri-dockerd")
-	if !nodeConfig.Docker && nodeConfig.ContainerRuntimeEndpoint == "" {
-		switch nodeConfig.AgentConfig.Snapshotter {
-		case "overlayfs":
-			if err := containerd.OverlaySupported(nodeConfig.Containerd.Root); err != nil {
-				return nil, errors.Wrapf(err, "\"overlayfs\" snapshotter cannot be enabled for %q, try using \"fuse-overlayfs\" or \"native\"",
-					nodeConfig.Containerd.Root)
-			}
-		case "fuse-overlayfs":
-			if err := containerd.FuseoverlayfsSupported(nodeConfig.Containerd.Root); err != nil {
-				return nil, errors.Wrapf(err, "\"fuse-overlayfs\" snapshotter cannot be enabled for %q, try using \"native\"",
-					nodeConfig.Containerd.Root)
-			}
-		case "stargz":
-			if err := containerd.StargzSupported(nodeConfig.Containerd.Root); err != nil {
-				return nil, errors.Wrapf(err, "\"stargz\" snapshotter cannot be enabled for %q, try using \"overlayfs\" or \"native\"",
-					nodeConfig.Containerd.Root)
-			}
-			nodeConfig.AgentConfig.ImageServiceSocket = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
-		}
-	}
 	nodeConfig.Containerd.Opt = filepath.Join(envInfo.DataDir, "agent", "containerd")
 	nodeConfig.Containerd.Log = filepath.Join(envInfo.DataDir, "agent", "containerd", "containerd.log")
+	nodeConfig.Containerd.Registry = filepath.Join(envInfo.DataDir, "agent", "etc", "containerd", "certs.d")
+	nodeConfig.Containerd.NoDefault = envInfo.ContainerdNoDefault
+	nodeConfig.Containerd.NonrootDevices = envInfo.ContainerdNonrootDevices
 	nodeConfig.Containerd.Debug = envInfo.Debug
-	applyContainerdStateAndAddress(nodeConfig)
-	applyCRIDockerdAddress(nodeConfig)
-	nodeConfig.Containerd.Template = filepath.Join(envInfo.DataDir, "agent", "etc", "containerd", "config.toml.tmpl")
-	nodeConfig.Certificate = servingCert
+	nodeConfig.Containerd.Template = filepath.Join(envInfo.DataDir, "agent", "etc", "containerd")
 
-	nodeConfig.AgentConfig.NodeIPs = nodeIPs
-	nodeIP, listenAddress, _, err := util.GetFirstIP(nodeIPs)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot configure IPv4/IPv6 node-ip")
+	if envInfo.Rootless {
+		nodeConfig.AgentConfig.RootDir = filepath.Join(envInfo.DataDir, "agent", "kubelet")
 	}
-	nodeConfig.AgentConfig.NodeIP = nodeIP.String()
-	nodeConfig.AgentConfig.ListenAddress = listenAddress
+
+	if envInfo.BindAddress != "" {
+		nodeConfig.AgentConfig.ListenAddress = envInfo.BindAddress
+	} else {
+		listenAddress, _, _, err := util.GetDefaultAddresses(nodeIPs[0])
+		if err != nil {
+			return nil, errors.Wrap(err, "cannot configure IPv4/IPv6 node-ip")
+		}
+		nodeConfig.AgentConfig.ListenAddress = listenAddress
+	}
+
+	nodeConfig.AgentConfig.NodeIP = nodeIPs[0].String()
+	nodeConfig.AgentConfig.NodeIPs = nodeIPs
 	nodeConfig.AgentConfig.NodeExternalIPs = nodeExternalIPs
 
 	// if configured, set NodeExternalIP to the first IPv4 address, for legacy clients
 	// unless only IPv6 address given
 	if len(nodeConfig.AgentConfig.NodeExternalIPs) > 0 {
-		nodeExternalIP, _, _, err := util.GetFirstIP(nodeConfig.AgentConfig.NodeExternalIPs)
-		if err != nil {
-			return nil, errors.Wrap(err, "cannot configure IPv4/IPv6 node-external-ip")
-		}
-		nodeConfig.AgentConfig.NodeExternalIP = nodeExternalIP.String()
+		nodeConfig.AgentConfig.NodeExternalIP = nodeConfig.AgentConfig.NodeExternalIPs[0].String()
 	}
+
+	var nodeExternalDNSs []string
+	for _, dnsString := range envInfo.NodeExternalDNS.Value() {
+		nodeExternalDNSs = append(nodeExternalDNSs, strings.Split(dnsString, ",")...)
+	}
+	nodeConfig.AgentConfig.NodeExternalDNSs = nodeExternalDNSs
+
+	var nodeInternalDNSs []string
+	for _, dnsString := range envInfo.NodeInternalDNS.Value() {
+		nodeInternalDNSs = append(nodeInternalDNSs, strings.Split(dnsString, ",")...)
+	}
+	nodeConfig.AgentConfig.NodeInternalDNSs = nodeInternalDNSs
 
 	nodeConfig.NoFlannel = nodeConfig.FlannelBackend == config.FlannelBackendNone
 	if !nodeConfig.NoFlannel {
@@ -532,15 +703,33 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		nodeConfig.AgentConfig.CNIBinDir = filepath.Dir(hostLocal)
 		nodeConfig.AgentConfig.CNIConfDir = filepath.Join(envInfo.DataDir, "agent", "etc", "cni", "net.d")
 		nodeConfig.AgentConfig.FlannelCniConfFile = envInfo.FlannelCniConfFile
+
+		// It does not make sense to use VPN without its flannel backend
+		if envInfo.VPNAuth != "" {
+			nodeConfig.FlannelBackend = vpnInfo.ProviderName
+		}
 	}
 
-	if nodeConfig.Docker {
+	if nodeConfig.ImageServiceEndpoint != "" {
+		nodeConfig.AgentConfig.ImageServiceSocket = nodeConfig.ImageServiceEndpoint
+	}
+
+	if nodeConfig.ContainerRuntimeEndpoint != "" {
+		nodeConfig.AgentConfig.RuntimeSocket = nodeConfig.ContainerRuntimeEndpoint
+	} else if nodeConfig.Docker {
+		if err := applyCRIDockerdOSSpecificConfig(nodeConfig); err != nil {
+			return nil, err
+		}
 		nodeConfig.AgentConfig.CNIPlugin = true
 		nodeConfig.AgentConfig.RuntimeSocket = nodeConfig.CRIDockerd.Address
-	} else if nodeConfig.ContainerRuntimeEndpoint == "" {
-		nodeConfig.AgentConfig.RuntimeSocket = nodeConfig.Containerd.Address
 	} else {
-		nodeConfig.AgentConfig.RuntimeSocket = nodeConfig.ContainerRuntimeEndpoint
+		if err := applyContainerdOSSpecificConfig(nodeConfig); err != nil {
+			return nil, err
+		}
+		if err := applyContainerdQoSClassConfigFileIfPresent(envInfo, &nodeConfig.Containerd); err != nil {
+			return nil, err
+		}
+		nodeConfig.AgentConfig.RuntimeSocket = nodeConfig.Containerd.Address
 	}
 
 	if controlConfig.ClusterIPRange != nil {
@@ -591,13 +780,47 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	nodeConfig.AgentConfig.NodeLabels = envInfo.Labels
 	nodeConfig.AgentConfig.ImageCredProvBinDir = envInfo.ImageCredProvBinDir
 	nodeConfig.AgentConfig.ImageCredProvConfig = envInfo.ImageCredProvConfig
-	nodeConfig.AgentConfig.PrivateRegistry = envInfo.PrivateRegistry
 	nodeConfig.AgentConfig.DisableCCM = controlConfig.DisableCCM
 	nodeConfig.AgentConfig.DisableNPC = controlConfig.DisableNPC
+	nodeConfig.AgentConfig.MinTLSVersion = controlConfig.MinTLSVersion
+	nodeConfig.AgentConfig.CipherSuites = controlConfig.CipherSuites
 	nodeConfig.AgentConfig.Rootless = envInfo.Rootless
 	nodeConfig.AgentConfig.PodManifests = filepath.Join(envInfo.DataDir, "agent", DefaultPodManifestPath)
 	nodeConfig.AgentConfig.ProtectKernelDefaults = envInfo.ProtectKernelDefaults
 	nodeConfig.AgentConfig.DisableServiceLB = envInfo.DisableServiceLB
+	nodeConfig.AgentConfig.VLevel = cmds.LogConfig.VLevel
+	nodeConfig.AgentConfig.VModule = cmds.LogConfig.VModule
+	nodeConfig.AgentConfig.LogFile = cmds.LogConfig.LogFile
+	nodeConfig.AgentConfig.AlsoLogToStderr = cmds.LogConfig.AlsoLogToStderr
+
+	privRegistries, err := registries.GetPrivateRegistries(envInfo.PrivateRegistry)
+	if err != nil {
+		return nil, err
+	}
+	nodeConfig.AgentConfig.Registry = privRegistries.Registry
+
+	if nodeConfig.EmbeddedRegistry {
+		psk, err := hex.DecodeString(controlConfig.IPSECPSK)
+		if err != nil {
+			return nil, err
+		}
+		if len(psk) < 32 {
+			return nil, errors.New("insufficient PSK bytes")
+		}
+
+		conf := spegel.DefaultRegistry
+		conf.ExternalAddress = nodeConfig.AgentConfig.NodeIP
+		conf.InternalAddress = controlConfig.Loopback(false)
+		conf.RegistryPort = strconv.Itoa(controlConfig.SupervisorPort)
+		conf.ClientCAFile = clientCAFile
+		conf.ClientCertFile = clientK3sControllerCert
+		conf.ClientKeyFile = clientK3sControllerKey
+		conf.ServerCAFile = serverCAFile
+		conf.ServerCertFile = servingKubeletCert
+		conf.ServerKeyFile = servingKubeletKey
+		conf.PSK = psk[:32]
+		conf.InjectMirror(nodeConfig)
+	}
 
 	if err := validateNetworkConfig(nodeConfig); err != nil {
 		return nil, err
@@ -606,14 +829,8 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	return nodeConfig, nil
 }
 
-// getAPIServers attempts to return a list of apiservers from the server.
-func getAPIServers(ctx context.Context, node *config.Node, proxy proxy.Proxy) ([]string, error) {
-	withCert := clientaccess.WithClientCertificate(node.AgentConfig.ClientKubeletCert, node.AgentConfig.ClientKubeletKey)
-	info, err := clientaccess.ParseAndValidateToken(proxy.SupervisorURL(), node.Token, withCert)
-	if err != nil {
-		return nil, err
-	}
-
+// GetAPIServers attempts to return a list of apiservers from the server.
+func GetAPIServers(ctx context.Context, info *clientaccess.Info) ([]string, error) {
 	data, err := info.Get("/v1-" + version.Program + "/apiservers")
 	if err != nil {
 		return nil, err
