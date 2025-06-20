@@ -4,6 +4,9 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  
 jobs:
   trivy_scan:
     if: github.event.issue.pull_request && github.event.comment.body == '/trivy'
@@ -43,7 +46,7 @@ jobs:
       run: curl -fsSO https://raw.githubusercontent.com/rancher/vexhub/refs/heads/main/reports/rancher.openvex.json
 
     - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@0.30.0
+      uses: aquasecurity/trivy-action@0.31.0
       with:
         image-ref: 'rancher/k3s:latest'
         format: 'table'
